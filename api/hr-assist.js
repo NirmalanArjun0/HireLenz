@@ -1,71 +1,86 @@
 // /api/hr-assist.js
 // One backend function handling all three HireLens tools: CV screening,
-// interview question generation, and job description writing. The
-// ANTHROPIC_API_KEY stays server-side here — never sent to the browser.
+// interview question generation, and job description writing. Runs on
+// Google's Gemini API, which has a genuine free tier (no credit card,
+// roughly 1,500 requests/day on gemini-2.5-flash as of writing). The
+// GEMINI_API_KEY stays server-side here — never sent to the browser.
+//
+// Note on free tier: Google's terms allow free-tier prompts to be used to
+// improve their models (this does not apply on their paid tier). Since this
+// app processes real resumes, that's worth knowing. See the README.
 //
 // Setup:
-// 1. Get an API key at console.anthropic.com (real usage cost — set a
-//    monthly spend cap in the console).
+// 1. Go to https://aistudio.google.com/apikey, sign in with a Google
+//    account, and click "Create API key". No billing required.
 // 2. In Vercel -> Settings -> Environment Variables, add:
-//      ANTHROPIC_API_KEY = your key
+//      GEMINI_API_KEY = your key
 // 3. Redeploy.
 
 const DAILY_LIMIT = 40; // total AI calls allowed per day, shared across all tools/users
 let requestLog = [];
 
-async function callClaude(prompt, maxTokens) {
-  const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+const GEMINI_MODEL = 'gemini-2.5-flash'; // free-tier eligible as of writing — check ai.google.dev if this changes
+
+async function callGemini(prompt, maxTokens) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
-    throw new Error('Server is missing ANTHROPIC_API_KEY (or it is empty). Set it in Vercel → Settings → Environment Variables and redeploy.');
-  }
-  // A stray newline/space pasted into the env var value causes Node's
-  // fetch to reject the header with "The string did not match the
-  // expected pattern." — catch that case specifically with a clear message.
-  if (/[\r\n\t]/.test(apiKey) || apiKey !== (process.env.ANTHROPIC_API_KEY || '')) {
-    // trimmed value differs from raw or contains control chars — warn but proceed with the cleaned version
-    console.warn('ANTHROPIC_API_KEY had leading/trailing whitespace or control characters; using a trimmed copy.');
+    throw new Error('Server is missing GEMINI_API_KEY (or it is empty). Set it in Vercel → Settings → Environment Variables and redeploy.');
   }
 
   let response;
   try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: maxTokens,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: maxTokens,
+            responseMimeType: 'application/json', // ask Gemini to guarantee valid JSON back
+          },
+        }),
+      }
+    );
   } catch (fetchErr) {
     if (/expected pattern/i.test(fetchErr.message || '')) {
-      throw new Error('ANTHROPIC_API_KEY appears to contain invalid characters (often a stray space or newline from copy-pasting). Re-copy the key from console.anthropic.com, re-paste it into Vercel → Settings → Environment Variables, and redeploy.');
+      throw new Error('GEMINI_API_KEY appears to contain invalid characters (often a stray space or newline from copy-pasting). Re-copy it from Google AI Studio, re-paste it into Vercel → Settings → Environment Variables, and redeploy.');
     }
     throw fetchErr;
   }
+
   const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || 'Anthropic API error');
-  const textBlock = (data.content || []).find(b => b.type === 'text');
-  if (!textBlock) throw new Error('No response received from the model.');
-  let clean = textBlock.text.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'Gemini API error');
+  }
+
+  const candidate = (data.candidates || [])[0];
+  const finishReason = candidate?.finishReason;
+  const textPart = candidate?.content?.parts?.find(p => typeof p.text === 'string');
+  if (!textPart) {
+    if (finishReason === 'SAFETY' || finishReason === 'PROHIBITED_CONTENT') {
+      throw new Error('The content was blocked by Gemini\'s safety filters. Try rephrasing the job description or resume text.');
+    }
+    throw new Error('No response received from the model.');
+  }
+
+  let clean = textPart.text.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
 
   try {
     return JSON.parse(clean);
   } catch (parseErr) {
-    // Most common cause: the model hit max_tokens mid-response and the JSON
-    // (usually a string value) got cut off before its closing quote/brace.
-    // Try to salvage a valid JSON object by trimming back to the last
-    // complete array/object entry before re-throwing a clearer error.
+    // Most common cause: the response got cut off mid-string before its
+    // closing quote/brace (finishReason "MAX_TOKENS"). Try to salvage a
+    // valid JSON object from whatever completed before the cutoff.
     const repaired = repairTruncatedJson(clean);
     if (repaired) return repaired;
 
-    const wasTruncated = data.stop_reason === 'max_tokens';
     throw new Error(
-      wasTruncated
+      finishReason === 'MAX_TOKENS'
         ? 'The response was cut off before it finished (too much content for the token limit). Try again with fewer resumes at once, or shorter resumes.'
         : 'The model returned a response that could not be read as valid data. Please try again.'
     );
@@ -75,17 +90,13 @@ async function callClaude(prompt, maxTokens) {
 // Attempts to recover a usable JSON object from a response that was cut off
 // mid-string or mid-array, by closing it off at the last complete item.
 function repairTruncatedJson(text) {
-  // Find the outermost array field (e.g. "ranked_candidates": [ ... ) and
-  // try progressively shorter versions, closing brackets/braces as we go.
   const arrayMatch = text.match(/^\{\s*"(\w+)"\s*:\s*\[/);
   if (!arrayMatch) return null;
 
   const key = arrayMatch[1];
-  // Walk backwards from the end, trying each "}," boundary as a cut point
-  // (a complete object followed by a comma or the array close).
   const candidates = [...text.matchAll(/\}\s*,/g)].map(m => m.index + 1);
   for (let i = candidates.length - 1; i >= 0; i--) {
-    const cut = text.slice(0, candidates[i]) ;
+    const cut = text.slice(0, candidates[i]);
     const attempt = cut + ']}';
     try {
       const parsed = JSON.parse(attempt);
@@ -97,17 +108,16 @@ function repairTruncatedJson(text) {
 
 module.exports = async (req, res) => {
   // Diagnostic route — visit /api/hr-assist?debug=1 in your browser (GET, no
-  // need to click anything in the UI). Confirms two things at once: (1) the
-  // latest code is actually deployed, and (2) whether ANTHROPIC_API_KEY is
-  // set and clean. Never exposes the key itself.
+  // need to click anything in the UI). Confirms the latest code is deployed
+  // and whether GEMINI_API_KEY is set and clean. Never exposes the key itself.
   if (req.method === 'GET' && req.query && req.query.debug === '1') {
-    const raw = process.env.ANTHROPIC_API_KEY || '';
+    const raw = process.env.GEMINI_API_KEY || '';
     return res.status(200).json({
-      deployed_version: 'debug-route-v1',
+      deployed_version: 'gemini-v1',
       api_key_present: !!raw,
       api_key_length: raw.length,
       api_key_has_whitespace_or_newline: /[\s\r\n\t]/.test(raw),
-      api_key_starts_with: raw ? raw.slice(0, 7) + '...' : null,
+      api_key_starts_with: raw ? raw.slice(0, 6) + '...' : null,
     });
   }
 
@@ -159,7 +169,7 @@ ${jobDescription.slice(0, 3000)}
 CANDIDATES:
 ${candidateBlock}`;
 
-      result = await callClaude(prompt, Math.min(8000, 900 + candidates.length * 400));
+      result = await callGemini(prompt, Math.min(8000, 900 + candidates.length * 400));
 
     } else if (action === 'interview_questions') {
       const { jobDescription, cv } = req.body;
@@ -182,7 +192,7 @@ ${jobDescription.slice(0, 3000)}
 """
 ${cv ? `\nCANDIDATE RESUME:\n"""\n${cv.slice(0, 3000)}\n"""` : ''}`;
 
-      result = await callClaude(prompt, 1200);
+      result = await callGemini(prompt, 1200);
 
     } else if (action === 'job_description') {
       const { roleTitle, bullets, tone } = req.body;
@@ -208,7 +218,7 @@ ROUGH NOTES:
 ${bullets.slice(0, 2000)}
 """`;
 
-      result = await callClaude(prompt, 1200);
+      result = await callGemini(prompt, 1200);
 
     } else {
       return res.status(400).json({ error: 'Unknown action.' });
